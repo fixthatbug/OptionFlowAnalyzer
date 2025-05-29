@@ -1,0 +1,28 @@
+options_flow_analyzer/
+├── config.py
+├── alpha_config.py
+├── main_app.py
+├── data_utils.py
+├── ui_builder.py
+├── tos_data_grabber.py
+├── coordinate_setup_wizard.py
+├── monitoring_manager.py
+├── data_fusion.py
+├── rtd_handler.py
+├── analysis_engine.py
+├── alpha_extractor.py
+├── real_time_alpha_monitor.py
+├── market_microstructure_analyzer.py
+├── analysis_modules/
+│   ├── __init__.py
+│   ├── analysis_helpers.py
+│   ├── flow_calculator.py
+│   ├── trade_pattern_detector.py
+│   ├── hf_burst_analyzer.py
+│   ├── volatility_analyzer.py
+│   ├── unusual_activity_detector.py
+│   ├── greek_flow_analyzer.py
+│   ├── strategy_identifier.py
+│   ├── report_generator.py
+│   └── alert_manager.py
+└── requirements.txt

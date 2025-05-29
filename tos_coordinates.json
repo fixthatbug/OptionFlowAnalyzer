@@ -1,0 +1,18 @@
+{
+    "ticker_symbol": {
+        "x": 36,
+        "y": 71
+    },
+    "option_statistics": {
+        "x": 207,
+        "y": 322,
+        "width": 0,
+        "height": 0
+    },
+    "time_sales": {
+        "x": 272,
+        "y": 280,
+        "width": 0,
+        "height": 0
+    }
+}

@@ -1,473 +1,807 @@
 # analysis_modules/report_generator.py
-# Functions for generating trade briefings and detailed text reports.
+"""
+Report generation for options flow analysis
+"""
 
 import pandas as pd
 import numpy as np
 from datetime import datetime
-import config
-import rtd_handler 
-from analysis_modules.analysis_helpers import categorize_moneyness, categorize_dte, get_sort_key 
+from typing import  Any
+import json
 
-def _format_percentage(value, default_na="N/A"):
-    if pd.notna(value) and isinstance(value, (int, float)):
-        return f"{value*100:.1f}%"
-    return default_na
-
-def _format_signed_percentage_change(value, default_na="N/A"):
-    if pd.notna(value) and isinstance(value, (int, float)):
-        return f"{value*100:+.1f}%" # Added plus sign for positive changes
-    return default_na
-
-def _format_float(value, precision=2, default_na="N/A"):
-    if pd.notna(value) and isinstance(value, (int, float)):
-        return f"{value:.{precision}f}"
-    return default_na
-
-def _format_int(value, default_na="N/A"):
-    if pd.notna(value) and isinstance(value, (int, float)): # Allow float if it's a whole number
-        return f"{int(value):,}" # Added comma for thousands
-    return default_na
-
-
-def _get_dynamic_strategy_suggestions(stance, primary_option_symbol, rtd_data_df_indexed, active_ticker, options_of_interest_symbols, holistic_analysis_results):
-    suggestions = []
-    option_name_readable = primary_option_symbol if primary_option_symbol else "a key option"
-    rtd_iv_str = "N/A (Check RTD)"
-    rtd_oi_str = "N/A (Check RTD)"
-    is_iv_high = None 
-
-    if primary_option_symbol and isinstance(rtd_data_df_indexed, pd.DataFrame) and not rtd_data_df_indexed.empty and primary_option_symbol in rtd_data_df_indexed.index:
-        live_data = rtd_data_df_indexed.loc[primary_option_symbol]
-        iv_val_str = str(live_data.get('IV (%)', 'N/A')).replace('%','')
-        try:
-            iv_numeric = float(iv_val_str) 
-            rtd_iv_str = _format_percentage(iv_numeric)
-            if iv_numeric > config.IV_HIGH_THRESHOLD: is_iv_high = True 
-            elif iv_numeric < config.IV_LOW_THRESHOLD: is_iv_high = False 
-        except (ValueError, TypeError): pass 
-        
-        oi_val = live_data.get('Open Int', 'N/A')
-        try: 
-            rtd_oi_str = _format_int(float(str(oi_val).replace(',',''))) if pd.notna(oi_val) and str(oi_val).replace(',','').replace('.','',1).isdigit() else str(oi_val)
-        except (ValueError, TypeError): 
-            rtd_oi_str = str(oi_val) 
-        
-        parsed_opt = rtd_handler.parse_tos_option_symbol(primary_option_symbol)
-        if parsed_opt:
-            exp_date_readable = datetime(parsed_opt['exp_year'], parsed_opt['exp_month'], parsed_opt['exp_day']).strftime('%b %d \'%y')
-            strike_f = float(parsed_opt['strike_price']) if pd.notna(parsed_opt['strike_price']) else np.nan
-            option_name_readable = f"{active_ticker} {exp_date_readable} {_format_float(strike_f)}{parsed_opt['option_type']}" if pd.notna(strike_f) else primary_option_symbol
-
-    suggestions.append(f"**Strategy Ideas for {option_name_readable} (Live IV: {rtd_iv_str}, OI: {rtd_oi_str}):**")
-
-    if stance.endswith("BULLISH"):
-        suggestions.append("  * **Long Call:** Simplest bullish bet. Max profit unlimited; max loss premium.")
-        if is_iv_high is False: suggestions.append("    * ✔️ *Favorable if IV is low/moderate.*")
-        elif is_iv_high is True: suggestions.append("    * ⚠️ *Costly if IV is high; risk of IV crush.*")
-        
-        suggestions.append("  * **Bull Call Spread (Debit):** Buy call, sell higher strike call. Reduces cost, defines risk/reward.")
-        if is_iv_high is True: suggestions.append("    * ✔️ *Good for high IV; benefits from skew.*")
-        
-        suggestions.append("  * **Bull Put Spread (Credit):** Sell put, buy lower strike put. Profit if stock stays above short put. Collects premium.")
-        if is_iv_high is True: suggestions.append("    * ✔️ *Good for high IV premium collection.*")
-        elif is_iv_high is False: suggestions.append("    * ⚠️ *Less premium if IV is low.*")
-
-    elif stance.endswith("BEARISH"):
-        suggestions.append("  * **Long Put:** Simplest bearish bet.")
-        if is_iv_high is False: suggestions.append("    * ✔️ *Favorable if IV is low/moderate.*")
-        elif is_iv_high is True: suggestions.append("    * ⚠️ *Costly if IV is high.*")
-
-        suggestions.append("  * **Bear Put Spread (Debit):** Buy put, sell lower strike put.")
-        if is_iv_high is True: suggestions.append("    * ✔️ *Good for reducing cost in high IV.*")
-        
-        suggestions.append("  * **Bear Call Spread (Credit):** Sell call, buy higher strike call.")
-        if is_iv_high is True: suggestions.append("    * ✔️ *Good for high IV premium collection.*")
-
-    elif "NEUTRAL" in stance or "OBSERVE" in stance :
-        suggestions.append("  * **Iron Condor (Credit):** Sell OTM call spread & OTM put spread. Profits if stock stays in range.")
-        if is_iv_high is True: suggestions.append("    * ✔️ *Ideal for high IV environments.*")
-        else: suggestions.append("    * ⚠️ *Lower premium & tighter profit range if IV is low.*")
-        
-        suggestions.append("  * **Long Straddle/Strangle (Debit, if expecting volatility spike):** Buy call & put.")
-        if is_iv_high is False: suggestions.append("    * ✔️ *Cheaper to establish if IV is low before catalyst.*")
-        elif is_iv_high is True: suggestions.append("    * ⚠️ *Very expensive if IV is already high; needs large move.*")
+def generate_detailed_txt_report(analysis_results: dict, ticker: str, 
+                               source_description: str = "Options Flow Analysis") -> str:
+    """Generate comprehensive text report"""
     
-    if len(suggestions) <= 1: 
-        suggestions.append("* No specific strategy variations generated based on current stance and IV. Consult general options education.*")
-    return "\n".join(suggestions)
+    report = f"""
+{'=' * 80}
+COMPREHENSIVE OPTIONS FLOW ANALYSIS REPORT
+{'=' * 80}
 
+TICKER: {ticker}
+ANALYSIS DATE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+SOURCE: {source_description}
 
-def generate_trade_briefing(holistic_analysis_results, rtd_data_df, active_ticker, options_of_interest_symbols):
-    briefing_parts = []
-    analysis_date_str = "N/A"
+{'=' * 80}
+EXECUTIVE SUMMARY
+{'=' * 80}
+"""
     
-    first_valid_timestamp = None
-    if 'ofi_binned_summary' in holistic_analysis_results:
-        ofi_binned_df_local = holistic_analysis_results.get('ofi_binned_summary', pd.DataFrame())
-        if isinstance(ofi_binned_df_local, pd.DataFrame) and not ofi_binned_df_local.empty and isinstance(ofi_binned_df_local.index, pd.DatetimeIndex):
-            if not ofi_binned_df_local.index.empty:
-                first_valid_timestamp = ofi_binned_df_local.index[0]
-    if pd.notna(first_valid_timestamp) and isinstance(first_valid_timestamp, pd.Timestamp):
-        analysis_date_str = first_valid_timestamp.strftime("%Y-%m-%d")
-
-    briefing_parts.append(f"## Actionable Trade Briefing & Strategy Recommendation")
-    briefing_parts.append(f"**Ticker:** {active_ticker} | **Flow Analysis Date:** {analysis_date_str} | **RTD Snapshot:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    briefing_parts.append("---")
-
-    if holistic_analysis_results.get("error"):
-        briefing_parts.append(f"\n**ERROR IN HISTORICAL ANALYSIS:** {holistic_analysis_results['error']}")
-        return "\n".join(briefing_parts)
-
-    stance = holistic_analysis_results.get('market_stance', "NEUTRAL - OBSERVE (Stance calculation error)")
-    conviction = holistic_analysis_results.get('stance_conviction', "Low (Conviction calculation error)")
-    primary_rationale = holistic_analysis_results.get('stance_primary_rationale', "Rationale not available or calculation error.")
-
-    briefing_parts.append(f"\n**I. Overall Stance & Conviction:**")
-    briefing_parts.append(f"* **Market Stance for {active_ticker}:** {stance} (Conviction: {conviction})")
-    briefing_parts.append(f"* **Primary Rationale:** {primary_rationale}")
-
-    briefing_parts.append("\n\n**II. Detailed Supporting Analysis & Observations:**")
-    ofi_binned_summary_df = holistic_analysis_results.get('ofi_binned_summary', pd.DataFrame())
-    net_ofi_sum_dollar = ofi_binned_summary_df['Net_OFI_Value'].sum() if not ofi_binned_summary_df.empty and 'Net_OFI_Value' in ofi_binned_summary_df.columns else 0.0
-    net_agg_qty_overall = ofi_binned_summary_df['Net_Aggressor_Qty'].sum() if not ofi_binned_summary_df.empty and 'Net_Aggressor_Qty' in ofi_binned_summary_df.columns else 0.0
-    briefing_parts.append(f"* **A. Overall Flow Diagnosis (Historical):** Net OFI: ${_format_float(net_ofi_sum_dollar,0)}. Net Agg Qty (all trades): {_format_int(net_agg_qty_overall)} contracts.")
+    # Add executive summary
+    report += _generate_executive_summary(analysis_results, ticker)
     
-    flow_by_moneyness = holistic_analysis_results.get('flow_by_moneyness', pd.DataFrame())
-    if not flow_by_moneyness.empty: 
-        briefing_parts.append(f"    * Flow by Moneyness (Net Agg Qty | Net OFI):\n{flow_by_moneyness[['NetAggressiveVolumeQty', 'NetDollarOFI']].to_string(float_format='%.2f')}")
+    # Data Summary
+    report += f"""
+{'=' * 80}
+DATA SUMMARY
+{'=' * 80}
+"""
+    data_summary = analysis_results.get('data_summary', {})
+    report += f"Total Trades Analyzed: {data_summary.get('total_trades', 0):,}\n"
+    report += f"Unique Options: {data_summary.get('unique_options', 0):,}\n"
+    report += f"Total Volume: {data_summary.get('total_volume', 0):,} contracts\n"
+    report += f"Total Notional: ${data_summary.get('total_notional', 0):,.0f}\n"
     
-    flow_by_dte = holistic_analysis_results.get('flow_by_dte', pd.DataFrame())
-    if not flow_by_dte.empty:
-        briefing_parts.append(f"\n    * Flow by DTE (Net Agg Qty | Net OFI):\n{flow_by_dte[['NetAggressiveVolumeQty', 'NetDollarOFI']].to_string(float_format='%.2f')}")
+    if data_summary.get('time_range'):
+        time_range = data_summary['time_range']
+        report += f"Time Range: {time_range.get('start', 'N/A')} to {time_range.get('end', 'N/A')}\n"
+    
+    # Alpha Signals Section
+    report += f"""
+{'=' * 80}
+ALPHA SIGNALS ANALYSIS
+{'=' * 80}
+"""
+    report += _generate_alpha_signals_section(analysis_results)
+    
+    # Flow Analysis Section
+    report += f"""
+{'=' * 80}
+FLOW ANALYSIS
+{'=' * 80}
+"""
+    report += _generate_flow_analysis_section(analysis_results)
+    
+    # Pattern Analysis Section
+    report += f"""
+{'=' * 80}
+PATTERN ANALYSIS
+{'=' * 80}
+"""
+    report += _generate_pattern_analysis_section(analysis_results)
+    
+    # Unusual Activity Section
+    report += f"""
+{'=' * 80}
+UNUSUAL ACTIVITY DETECTION
+{'=' * 80}
+"""
+    report += _generate_unusual_activity_section(analysis_results)
+    
+    # Volatility Analysis Section
+    report += f"""
+{'=' * 80}
+VOLATILITY ANALYSIS
+{'=' * 80}
+"""
+    report += _generate_volatility_analysis_section(analysis_results)
+    
+    # Greek Analysis Section
+    report += f"""
+{'=' * 80}
+GREEK FLOW ANALYSIS
+{'=' * 80}
+"""
+    report += _generate_greek_analysis_section(analysis_results)
+    
+    # Strategy Analysis Section
+    report += f"""
+{'=' * 80}
+STRATEGY IDENTIFICATION
+{'=' * 80}
+"""
+    report += _generate_strategy_analysis_section(analysis_results)
+    
+    # Options of Interest Section
+    report += f"""
+{'=' * 80}
+OPTIONS OF INTEREST
+{'=' * 80}
+"""
+    report += _generate_options_of_interest_section(analysis_results)
+    
+    # Risk Assessment Section
+    report += f"""
+{'=' * 80}
+RISK ASSESSMENT & ALERTS
+{'=' * 80}
+"""
+    report += _generate_risk_assessment_section(analysis_results)
+    
+    # Trade Recommendations Section
+    report += f"""
+{'=' * 80}
+TRADE RECOMMENDATIONS
+{'=' * 80}
+"""
+    report += _generate_trade_recommendations_section(analysis_results)
+    
+    # Key Insights Section
+    report += f"""
+{'=' * 80}
+KEY INSIGHTS
+{'=' * 80}
+"""
+    report += _generate_key_insights_section(analysis_results)
+    
+    # Footer
+    report += f"""
+{'=' * 80}
+END OF REPORT
+Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+{'=' * 80}
+"""
+    
+    return report
 
-    briefing_parts.append("\n* **B. High-Frequency Insights (Top Bursts Detailed):**") 
-    identified_bursts_df = holistic_analysis_results.get('identified_hf_bursts', pd.DataFrame())
-    if not identified_bursts_df.empty:
-        sorted_bursts_for_briefing = identified_bursts_df.copy()
-        if 'PeakValue' in sorted_bursts_for_briefing.columns:
-            sorted_bursts_for_briefing['AbsPeakValue'] = sorted_bursts_for_briefing['PeakValue'].abs()
-            sorted_bursts_for_briefing = sorted_bursts_for_briefing.sort_values(by='AbsPeakValue', ascending=False)
+def _generate_executive_summary(analysis_results: dict, ticker: str) -> str:
+    """Generate executive summary"""
+    
+    summary = ""
+    
+    # Alpha signals summary
+    alpha_signals = analysis_results.get('alpha_signals', [])
+    urgent_signals = [s for s in alpha_signals if hasattr(s, 'urgency_score') and s.urgency_score >= 85]
+    
+    if alpha_signals:
+        summary += f"🎯 ALPHA SIGNALS: {len(alpha_signals)} signals detected ({len(urgent_signals)} urgent)\n"
         
-        num_bursts_to_detail = config.HF_BURST_BRIEFING_TOP_N_DISPLAY 
+        if urgent_signals:
+            top_signal = max(urgent_signals, key=lambda x: x.urgency_score)
+            summary += f"   🚨 MOST URGENT: {top_signal.signal_type.value} in {top_signal.option_symbol}\n"
+            summary += f"      Confidence: {top_signal.confidence:.0f}% | Urgency: {top_signal.urgency_score:.0f}\n"
+    
+    # Flow summary
+    flow_analysis = analysis_results.get('flow_analysis', {})
+    if flow_analysis:
+        basic_metrics = flow_analysis.get('basic_metrics', {})
+        directional_flow = flow_analysis.get('directional_flow', {})
         
-        briefing_parts.append(f"    * **Detailed Look at Top {min(num_bursts_to_detail, len(sorted_bursts_for_briefing))} Significant HF Bursts:**")
-
-        for i, (_, burst_row) in enumerate(sorted_bursts_for_briefing.head(num_bursts_to_detail).iterrows()):
-            value_unit = "$" if "OFI" in burst_row.get('BurstType','') else "contracts"
-            start_time_dt = pd.Timestamp(burst_row.get('StartTime')) 
-            start_time_str = start_time_dt.strftime('%H:%M:%S') if pd.notna(start_time_dt) else 'N/A'
-            
-            ul_price_start_burst = burst_row.get('UnderlyingPrice_Start', np.nan)
-            ul_price_end_burst = burst_row.get('UnderlyingPrice_End', np.nan)
-            ul_price_min_burst = burst_row.get('UnderlyingPrice_MinInBurst', np.nan) 
-            ul_price_max_burst = burst_row.get('UnderlyingPrice_MaxInBurst', np.nan)
-
-            ul_price_start_str = _format_float(ul_price_start_burst)
-            ul_price_end_str = _format_float(ul_price_end_burst)
-            ul_price_range_str = f" (Range: {_format_float(ul_price_min_burst)}-{_format_float(ul_price_max_burst)})" if pd.notna(ul_price_min_burst) and pd.notna(ul_price_max_burst) else ""
-            
-            briefing_parts.append(
-                f"        * **Burst {i+1} ({burst_row.get('BurstType','N/A')} - {burst_row.get('Direction','N/A')}):** "
-                f"Start: {start_time_str}, Dur: {_format_float(burst_row.get('DurationSeconds',0),1)}s, Peak: {_format_int(burst_row.get('PeakValue',0))} {value_unit}. "
-                f"UL Price: {ul_price_start_str} -> {ul_price_end_str}{ul_price_range_str}."
-            )
-            
-            top_options_in_burst = burst_row.get('TopOptionsInBurst', [])
-            if top_options_in_burst:
-                briefing_parts.append("            * Key Contracts in this Burst:")
-                for opt_detail in top_options_in_burst:
-                    iv_change_str = _format_signed_percentage_change(opt_detail.get('iv_change_in_burst'))
-                    avg_iv_str = _format_percentage(opt_detail.get('avg_iv_in_burst'))
-                    iv_start_str = _format_percentage(opt_detail.get('iv_start_trade'))
-                    iv_end_str = _format_percentage(opt_detail.get('iv_end_trade'))
-                    avg_delta_str = _format_float(opt_detail.get('avg_delta_in_burst'), 2)
-
-                    briefing_parts.append(
-                        f"                - {opt_detail.get('tos_symbol','N/A')} (DTE: {opt_detail.get('dte_at_burst','N/A')}): "
-                        f"Qty: {_format_int(opt_detail.get('total_qty_in_burst',0))}, NetAgg: {_format_int(opt_detail.get('net_agg_qty_in_burst',0))}. "
-                        f"IV: {iv_start_str} -> {iv_end_str} (Chg: {iv_change_str}, Avg: {avg_iv_str}). "
-                        f"AvgDelta: {avg_delta_str}"
-                    )
-            else:
-                briefing_parts.append("            * No specific top options detailed for this burst.")
-            briefing_parts.append("") 
+        summary += f"\n📊 FLOW OVERVIEW:\n"
+        summary += f"   Total Premium: ${basic_metrics.get('total_premium', 0):,.0f}\n"
+        summary += f"   Call/Put Ratio: {directional_flow.get('call_put_volume_ratio', 1):.2f}\n"
         
-        if len(identified_bursts_df) > num_bursts_to_detail:
-             briefing_parts.append(f"        * ... and {len(identified_bursts_df)-num_bursts_to_detail} more bursts identified (see detailed report).")
-    else: 
-        briefing_parts.append("    * No significant HF bursts met criteria.")
-
-    briefing_parts.append("\n* **C. Standout Option Trades & Strategies (Historical Flow):**")
-    
-    identified_sweeps = holistic_analysis_results.get('identified_sweep_orders', [])
-    if identified_sweeps:
-        briefing_parts.append("    * **Noteworthy Sweep Orders Detected (Top 3 by Quantity):**")
-        sorted_sweeps = sorted(identified_sweeps, key=lambda x: x.get('total_quantity', 0), reverse=True)
-        for i, sweep in enumerate(sorted_sweeps[:3]):
-            start_time_dt = pd.Timestamp(sweep.get('start_time'))
-            end_time_dt = pd.Timestamp(sweep.get('end_time'))
-            briefing_parts.append(
-                f"        * **{sweep.get('aggressor_side','N/A')} Sweep:** {_format_int(sweep.get('total_quantity',0))} contracts of "
-                f"{sweep.get('tos_symbol','N/A')} from {start_time_dt.strftime('%H:%M:%S')} to "
-                f"{end_time_dt.strftime('%H:%M:%S')} across "
-                f"{len(sweep.get('exchanges_involved',[]))} exchanges. Avg Price: ${_format_float(sweep.get('average_price',0))}."
-            )
-        if len(sorted_sweeps) > 3: briefing_parts.append(f"        * ... and {len(sorted_sweeps)-3} more sweeps.")
-
-    identified_strategies = holistic_analysis_results.get('identified_common_strategies', [])
-    if identified_strategies:
-        briefing_parts.append("    * **Noteworthy Complex Strategies Identified (Top 3 by Quantity):**")
-        sorted_strategies = sorted(identified_strategies, key=lambda x: x.get('total_quantity',0), reverse=True) 
-        for i, strategy in enumerate(sorted_strategies[:3]): 
-            strat_time_dt = pd.Timestamp(strategy.get('time'))
-            strat_time_str = strat_time_dt.strftime('%H:%M:%S') if pd.notna(strat_time_dt) else "N/A"
-            underlying_price_at_trade = strategy.get('underlying_at_trade', np.nan)
-            underlying_price_str = _format_float(underlying_price_at_trade)
-            
-            briefing_parts.append(
-                f"        * **{strategy.get('strategy_type','Unknown Strategy')} ({strategy.get('condition', 'N/A')}):** {strategy.get('description','N/A')} "
-                f"at {strat_time_str} (UL: {underlying_price_str})."
-            )
-            for leg_idx, leg in enumerate(strategy.get('legs', [])):
-                leg_iv_str = _format_percentage(leg.get('IV'))
-                briefing_parts.append(
-                    f"            - Leg: {_format_int(leg.get('TradeQuantity',0))} {leg.get('Option_Description_orig','Leg')} @ ${_format_float(leg.get('Trade_Price',0))} (IV: {leg_iv_str})"
-                )
-            if strategy.get('combined_premium') is not None:
-                 briefing_parts.append(f"            - Approx. Combined Premium: ${_format_float(strategy['combined_premium'])}")
-            interpretation = "This large "
-            if strategy.get('strategy_type') == "Straddle" or strategy.get('strategy_type') == "Strangle":
-                interpretation += f"{strategy.get('strategy_type','strategy').lower()} suggests a significant bet on volatility for {strategy.get('active_ticker','ticker')}."
-            else: interpretation += f"{strategy.get('strategy_type','strategy').lower()} suggests a specific strategic play."
-            briefing_parts.append(f"            - Interpretation: {interpretation}")
-
-    individual_block_trades_df = holistic_analysis_results.get('individual_block_trades_summary', pd.DataFrame())
-    if not individual_block_trades_df.empty:
-        briefing_parts.append("    * **Noteworthy Individual Block Trades (Not part of above strategies/sweeps, Top 3 by Qty):**")
-        for i, (_, row) in enumerate(individual_block_trades_df.head(3).iterrows()): 
-            trade_time_dt = pd.to_datetime(row.get('Time'))
-            trade_time_str = trade_time_dt.strftime('%H:%M:%S') if pd.notna(trade_time_dt) else "N/A"
-            exp_date_dt = pd.to_datetime(row.get('Expiration_Date')) if pd.notna(row.get('Expiration_Date')) else pd.NaT
-
-            iv_str = _format_percentage(row.get('IV'))
-            delta_str = _format_float(row.get('Delta'), 2)
-            
-            moneyness = categorize_moneyness(row.get('Delta'), row.get('Option_Type')) 
-            dte_cat = categorize_dte(exp_date_dt, trade_time_dt) 
-            
-            intent_detail = f"{row.get('Aggressor','N/A')} of {_format_int(row.get('TradeQuantity','N/A'))} {row.get('Option_Description_orig','N/A')} @ ${_format_float(row.get('Trade_Price',0))}."
-            intent_detail += f" (IV: {iv_str}, Delta: {delta_str}, {moneyness}, {dte_cat}, UL: ${_format_float(row.get('Underlying_Price',0))} at {trade_time_str}, Cond: {row.get('Condition', 'N/A')})"
-            briefing_parts.append(f"        * {intent_detail}")
-    elif not identified_strategies and not identified_sweeps: 
-        briefing_parts.append(f"    * No block trades (qty >= {config.LARGE_TRADE_THRESHOLD_QTY}), common strategies, or sweeps readily identified in this dataset.")
-
-    briefing_parts.append("\n\n**III. Key Options of Interest & Live RTD Snapshot (Max 20 for RTD list):**")
-    options_details_map = holistic_analysis_results.get('options_of_interest_details_map', {})
-    if not options_details_map:
-        briefing_parts.append("* No specific options of high interest identified from historical flow.")
-    else:
-        rtd_df_indexed = rtd_data_df.set_index('ToS Symbol') if isinstance(rtd_data_df, pd.DataFrame) and 'ToS Symbol' in rtd_data_df.columns and not rtd_data_df.empty and rtd_data_df.index.name != 'ToS Symbol' else pd.DataFrame()
-        display_count = 0
-        
-        sorted_options_for_display = sorted(list(options_details_map.values()), key=get_sort_key)
-
-        for item_details in sorted_options_for_display:
-            if display_count >= config.MAX_OPTIONS_FOR_BRIEFING_DISPLAY: break  
-            item_symbol_or_desc = item_details.get('symbol', 'N/A Symbol') 
-            reason = item_details.get('reason', 'General Interest')
-            metric_val = item_details.get('metric')
-            metric_str = _format_int(metric_val) if isinstance(metric_val, (int, float)) else str(metric_val) if pd.notna(metric_val) else ""
-            briefing_parts.append(f"* `{item_symbol_or_desc}` (Reason: {reason}, Metric: {metric_str})")
-
-            details_dict_for_item = item_details.get('details_dict', {})
-
-            if "Sweep Order" in reason:
-                sweep_data = details_dict_for_item
-                start_time_dt_sweep = pd.Timestamp(sweep_data.get('start_time'))
-                end_time_dt_sweep = pd.Timestamp(sweep_data.get('end_time'))
-                briefing_parts.append(
-                    f"    * Sweep Details: {_format_int(sweep_data.get('total_quantity',0))} contracts from "
-                    f"{start_time_dt_sweep.strftime('%H:%M:%S')} to {end_time_dt_sweep.strftime('%H:%M:%S')} "
-                    f"across {len(sweep_data.get('exchanges_involved',[]))} exchanges. Avg Price: ${_format_float(sweep_data.get('average_price',0))}."
-                )
-            elif item_details.get('is_complex_strategy', False):
-                strategy_data = details_dict_for_item 
-                legs_info = []
-                for leg in strategy_data.get('legs',[]):
-                    legs_info.append(f"{_format_int(leg.get('TradeQuantity',0))} {leg.get('Option_Description_orig','Leg')} @ ${_format_float(leg.get('Trade_Price',0))}")
-                combined_premium_val = strategy_data.get('combined_premium')
-                combined_premium_str = _format_float(combined_premium_val)
-                briefing_parts.append(f"    * Strategy Details: {', '.join(legs_info)}. Approx. Combined Premium: ${combined_premium_str}")
-            elif isinstance(item_symbol_or_desc, str) and item_symbol_or_desc.startswith('.'): 
-                if not rtd_df_indexed.empty and item_symbol_or_desc in rtd_df_indexed.index:
-                    live = rtd_df_indexed.loc[item_symbol_or_desc]
-                    live_iv_str = _format_percentage(live.get('IV (%)'))
-                    live_delta_str = _format_float(live.get('Delta'),2)
-                    live_last_str = _format_float(live.get('Last'))
-                    live_bid_str = _format_float(live.get('Bid'))
-                    live_ask_str = _format_float(live.get('Ask'))
-                    live_vol_str = _format_int(live.get('Volume'))
-                    live_oi_str = _format_int(live.get('Open Int'))
-
-
-                    briefing_parts.append(f"    * RTD: Last: {live_last_str}, Bid: {live_bid_str}, Ask: {live_ask_str}, Vol: {live_vol_str}, OI: {live_oi_str}, IV: {live_iv_str}, Delta: {live_delta_str}")
-                else: briefing_parts.append("    * RTD: Live data not available for this symbol in current snapshot.")
-            display_count += 1
-
-    briefing_parts.append("\n\n**IV. Illustrative Strategy Considerations (Based on Stance & Primary Option):**")
-    primary_opt_for_strat = options_of_interest_symbols[0] if options_of_interest_symbols else None
-    rtd_df_indexed_for_strat = rtd_data_df.set_index('ToS Symbol') if isinstance(rtd_data_df, pd.DataFrame) and 'ToS Symbol' in rtd_data_df.columns and not rtd_data_df.empty and rtd_data_df.index.name != 'ToS Symbol' else pd.DataFrame()
-    strategy_text = _get_dynamic_strategy_suggestions(stance, primary_opt_for_strat, rtd_df_indexed_for_strat, active_ticker, options_of_interest_symbols, holistic_analysis_results)
-    briefing_parts.append(strategy_text)
-
-    briefing_parts.append("\n\n**V. My \"Wall Street\" Perspective & Refined Strategic Considerations:**")
-    perspective = f"For {active_ticker}, the current stance is **{stance}** (Conviction: {conviction}). " 
-    perspective += f"{primary_rationale} " 
-    
-    if options_details_map and (stance == "NEUTRAL - OBSERVE" or "MODERATELY" in stance):
-        top_interest_items_for_perspective = sorted(list(options_details_map.values()), key=get_sort_key) 
-        if top_interest_items_for_perspective:
-            top_item = top_interest_items_for_perspective[0] 
-            if "Sweep Order" in top_item.get('reason',''):
-                 perspective += f" Noteworthy is the {top_item['reason']} for {top_item['symbol']} (Qty: {_format_int(top_item.get('metric',0))}), suggesting urgent positioning. "
-            elif top_item.get('is_complex_strategy'):
-                perspective += f" Significant complex trades like the identified {top_item.get('strategy_details',{}).get('strategy_type','Unknown Strategy')} ({top_item['symbol']}) suggest sophisticated positioning. "
-
-    briefing_parts.append(perspective)
-    briefing_parts.append("\n**Key Risks & Management:** Options trading involves substantial risk. Always manage risk exposure. This analysis is a snapshot based on historical flow; live market conditions and your trading plan dictate actual trades.")
-    briefing_parts.append("\n**Next Steps:** Actively monitor RTD for 'Options of Interest.' Correlate with live underlying price action, volume, and key technical levels. Await entry/exit triggers aligned with your specific trading plan and risk tolerance.")
-    return "\n".join(briefing_parts)
-
-def generate_detailed_txt_report(holistic_analysis_results, active_ticker, rtd_data_df=None):
-    report_lines = []
-    analysis_date_str = "N/A"
-    first_valid_timestamp = None
-    if 'ofi_binned_summary' in holistic_analysis_results: 
-        ofi_binned_df_local = holistic_analysis_results.get('ofi_binned_summary', pd.DataFrame())
-        if isinstance(ofi_binned_df_local, pd.DataFrame) and not ofi_binned_df_local.empty and isinstance(ofi_binned_df_local.index, pd.DatetimeIndex):
-            if not ofi_binned_df_local.index.empty:
-                first_valid_timestamp = ofi_binned_df_local.index[0]
-    if pd.notna(first_valid_timestamp) and isinstance(first_valid_timestamp, pd.Timestamp):
-        analysis_date_str = first_valid_timestamp.strftime("%Y-%m-%d")
-
-    report_lines.append(f"--- Detailed Flow Analysis Report for: {active_ticker} ---")
-    report_lines.append(f"Analysis Date (from data): {analysis_date_str}") 
-    report_lines.append(f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    stance = holistic_analysis_results.get('market_stance', "N/A")
-    conviction = holistic_analysis_results.get('stance_conviction', "N/A")
-    rationale = holistic_analysis_results.get('stance_primary_rationale', "N/A")
-    report_lines.append(f"\n--- Calculated Market Stance ---")
-    report_lines.append(f"Stance: {stance} (Conviction: {conviction})")
-    report_lines.append(f"Rationale: {rationale}")
-
-    report_lines.append("\n--- Overall Summary ---")
-    ofi_binned_summary = holistic_analysis_results.get('ofi_binned_summary', pd.DataFrame())
-    if not ofi_binned_summary.empty:
-        report_lines.append(f"Net OFI (Total): ${_format_float(ofi_binned_summary['Net_OFI_Value'].sum(),0)}")
-        report_lines.append(f"Net Aggressor Qty (Total): {_format_int(ofi_binned_summary['Net_Aggressor_Qty'].sum())}")
-    
-    report_lines.append("\n--- Identified Sweep Orders ---")
-    identified_sweeps = holistic_analysis_results.get('identified_sweep_orders', [])
-    if identified_sweeps:
-        for i, sweep in enumerate(identified_sweeps):
-            start_time_dt_sweep = pd.Timestamp(sweep.get('start_time'))
-            end_time_dt_sweep = pd.Timestamp(sweep.get('end_time'))
-            report_lines.append(
-                f"  Sweep {i+1}: {sweep.get('aggressor_side','N/A')} of {_format_int(sweep.get('total_quantity',0))} {sweep.get('tos_symbol','N/A')} "
-                f"from {start_time_dt_sweep.strftime('%H:%M:%S')} to {end_time_dt_sweep.strftime('%H:%M:%S')} "
-                f"across {len(sweep.get('exchanges_involved',[]))} exchanges. Avg Price: ${_format_float(sweep.get('average_price',0))}. "
-                f"Legs: {sweep.get('number_of_legs')}"
-            )
-    else:
-        report_lines.append("  None identified.")
-
-    report_lines.append("\n--- Identified Common Strategies ---")
-    identified_strategies = holistic_analysis_results.get('identified_common_strategies', [])
-    if identified_strategies:
-        for i, strategy in enumerate(identified_strategies):
-            report_lines.append(f"  Strategy {i+1}: {strategy.get('description', 'N/A')}")
-            for leg_idx, leg in enumerate(strategy.get('legs', [])):
-                 leg_iv_str = _format_percentage(leg.get('IV'))
-                 report_lines.append(f"    - Leg {leg_idx+1}: {_format_int(leg.get('TradeQuantity',0))} {leg.get('Option_Description_orig','N/A')} @ ${_format_float(leg.get('Trade_Price',0))} (IV: {leg_iv_str})")
-            if strategy.get('combined_premium') is not None:
-                 report_lines.append(f"    - Approx. Combined Premium: ${_format_float(strategy['combined_premium'])}")
-    else:
-        report_lines.append("  None identified.")
-
-    report_lines.append("\n--- Individual Block Trades (Not part of above strategies/sweeps) ---")
-    individual_blocks = holistic_analysis_results.get('individual_block_trades_summary', pd.DataFrame())
-    if not individual_blocks.empty:
-        blocks_to_display = individual_blocks.copy()
-        if 'Time' in blocks_to_display.columns:
-            blocks_to_display['Time'] = pd.to_datetime(blocks_to_display['Time'], errors='coerce')
-        formatters = {}
-        cols_to_format_float = ['Trade_Price', 'Underlying_Price', 'IV', 'Delta', 'Strike_Price']
-        for col_f in cols_to_format_float:
-            if col_f in blocks_to_display.columns:
-                if col_f == 'IV': formatters[col_f] = lambda x: _format_percentage(x, default_na="N/A")
-                elif col_f == 'Delta': formatters[col_f] = lambda x: _format_float(x, 4, "N/A") # More precision for delta
-                else: formatters[col_f] = lambda x: _format_float(x, 2, "N/A")
-        if 'TradeQuantity' in blocks_to_display.columns:
-            formatters['TradeQuantity'] = lambda x: _format_int(x, "N/A")
-        if 'Time' in blocks_to_display.columns: 
-            formatters['Time'] = lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(x) else "N/A"
-        report_lines.append(blocks_to_display.to_string(index=False, formatters=formatters))
-    else:
-        report_lines.append("  No individual block trades met criteria (after strategy/sweep extraction).")
-    
-    report_lines.append("\n--- High-Frequency Bursts (Detailed) ---") 
-    hf_bursts_df = holistic_analysis_results.get('identified_hf_bursts', pd.DataFrame())
-    if not hf_bursts_df.empty:
-        for idx, burst_row in hf_bursts_df.iterrows(): 
-            start_time_dt_burst = pd.Timestamp(burst_row.get('StartTime'))
-            start_time_str = start_time_dt_burst.strftime('%H:%M:%S') if pd.notna(start_time_dt_burst) else 'N/A'
-            
-            ul_price_start_burst = burst_row.get('UnderlyingPrice_Start', np.nan)
-            ul_price_end_burst = burst_row.get('UnderlyingPrice_End', np.nan)
-            ul_price_min_burst = burst_row.get('UnderlyingPrice_MinInBurst', np.nan)
-            ul_price_max_burst = burst_row.get('UnderlyingPrice_MaxInBurst', np.nan)
-
-            ul_price_start_str = _format_float(ul_price_start_burst)
-            ul_price_end_str = _format_float(ul_price_end_burst)
-            ul_price_range_str = f" (Range: {_format_float(ul_price_min_burst)}-{_format_float(ul_price_max_burst)})" if pd.notna(ul_price_min_burst) and pd.notna(ul_price_max_burst) else ""
-            
-            report_lines.append(
-                f"  Burst {idx+1} ({burst_row.get('BurstType','N/A')} - {burst_row.get('Direction','N/A')}): "
-                f"Start: {start_time_str}, Dur: {_format_float(burst_row.get('DurationSeconds',0),1)}s, Peak: {_format_int(burst_row.get('PeakValue',0))} "
-                f"{'$' if 'OFI' in burst_row.get('BurstType','') else 'contracts'}. "
-                f"UL Price: {ul_price_start_str} -> {ul_price_end_str}{ul_price_range_str}."
-            )
-            top_options_in_burst = burst_row.get('TopOptionsInBurst', [])
-            if top_options_in_burst:
-                report_lines.append("    Key Contracts in this Burst:")
-                for opt_detail in top_options_in_burst:
-                    iv_start_str = _format_percentage(opt_detail.get('iv_start_trade'))
-                    iv_end_str = _format_percentage(opt_detail.get('iv_end_trade'))
-                    iv_change_str = _format_signed_percentage_change(opt_detail.get('iv_change_in_burst'))
-                    avg_iv_str = _format_percentage(opt_detail.get('avg_iv_in_burst'))
-                    avg_delta_str = _format_float(opt_detail.get('avg_delta_in_burst'), 2)
-
-                    report_lines.append(
-                        f"      - {opt_detail.get('tos_symbol','N/A')} (DTE: {opt_detail.get('dte_at_burst','N/A')}): "
-                        f"Qty: {_format_int(opt_detail.get('total_qty_in_burst',0))}, NetAgg: {_format_int(opt_detail.get('net_agg_qty_in_burst',0))}, "
-                        f"AvgIV: {avg_iv_str}, IV: {iv_start_str}->{iv_end_str} (Chg: {iv_change_str}), AvgDelta: {avg_delta_str}"
-                    )
-            else:
-                report_lines.append("    No specific top options detailed for this burst.")
-            report_lines.append("") 
-    else:
-        report_lines.append("  No significant HF bursts identified.")
-
-    for key in ['flow_by_moneyness', 'flow_by_dte', 'iv_by_moneyness', 'iv_by_dte', 'most_active_options_by_volume']:
-        report_lines.append(f"\n--- {key.replace('_', ' ').title()} ---")
-        data_item = holistic_analysis_results.get(key)
-        if isinstance(data_item, (pd.DataFrame, pd.Series)) and not data_item.empty:
-            report_lines.append(data_item.to_string(float_format='%.2f'))
-        elif data_item is not None:
-             report_lines.append(str(data_item))
+        # Determine bias
+        cp_ratio = directional_flow.get('call_put_volume_ratio', 1)
+        if cp_ratio > 1.2:
+            summary += f"   📈 BIAS: BULLISH (Call dominant)\n"
+        elif cp_ratio < 0.8:
+            summary += f"   📉 BIAS: BEARISH (Put dominant)\n"
         else:
-            report_lines.append("  Data not available.")
+            summary += f"   ➡️ BIAS: NEUTRAL\n"
+    
+    # Composite scores
+    composite_scores = analysis_results.get('composite_scores', {})
+    if composite_scores:
+        summary += f"\n🎲 MARKET CONVICTION:\n"
+        summary += f"   Overall Score: {composite_scores.get('overall_conviction', 0):.0f}/100\n"
+        summary += f"   Institutional Activity: {composite_scores.get('institutional_activity', 0):.0f}/100\n"
+    
+    return summary + "\n"
+
+def _generate_alpha_signals_section(analysis_results: dict) -> str:
+    """Generate alpha signals section"""
+    
+    section = ""
+    alpha_signals = analysis_results.get('alpha_signals', [])
+    
+    if not alpha_signals:
+        section += "No alpha signals detected in the analyzed data.\n"
+    else:
+        # Add code here to format the alpha_signals into the section string
+        # For example:
+        section += "ALPHA SIGNALS:\n" + "-"*20 + "\n"
+        for i, signal in enumerate(alpha_signals[:5], 1): # Example: show top 5
+            section += f"{i}. Symbol: {getattr(signal, 'option_symbol', 'N/A')}\n" # Use getattr for safety
+            section += f"   Type: {getattr(getattr(signal, 'signal_type', None), 'value', 'N/A')}\n"
+            section += f"   Direction: {getattr(signal, 'direction', 'N/A')}\n"
+            section += f"   Confidence: {getattr(signal, 'confidence', 0):.1f}%\n\n"
             
-    report_lines.append("\n--- End of Report ---")
-    return "\n".join(report_lines)
+    return section # Make sure to return the constructed section
+
+# This function definition should start at the same indentation level
+# as the _generate_alpha_signals_section above.
+def _generate_unusual_activity_section(analysis_results: dict) -> str:
+    """Generate unusual activity section"""
+    
+    section = "" # Initialize section for this function
+    unusual_activity = analysis_results.get('unusual_activity', {})
+    
+    if not unusual_activity:
+        section += "No unusual activity detected.\n"
+        return section
+    
+    # Volume unusual
+    volume_unusual = unusual_activity.get('volume_unusual', [])
+    if volume_unusual:
+        section += f"UNUSUAL VOLUME: {len(volume_unusual)} options detected\n"
+        for i, item in enumerate(volume_unusual[:5], 1):
+            section += f"{i}. {item.get('symbol', 'N/A')}\n"
+            section += f"   Current: {item.get('current_volume', 0):,} vs Avg: {item.get('average_volume', 0):,}\n"
+            section += f"   Ratio: {item.get('volume_ratio', 1):.1f}x | Notional: ${item.get('notional_value', 0):,.0f}\n"
+        section += "\n"
+    
+    # Size unusual
+    size_unusual = unusual_activity.get('size_unusual', [])
+    if size_unusual:
+        section += f"UNUSUAL TRADE SIZES: {len(size_unusual)} large trades\n"
+        for i, item in enumerate(size_unusual[:5], 1):
+            section += f"{i}. {item.get('symbol', 'N/A')} - {item.get('size', 0):,} contracts\n"
+            section += f"   Percentile: {item.get('percentile', 0):.1f}% | Notional: ${item.get('notional', 0):,.0f}\n"
+        section += "\n"
+    
+    # Premium unusual
+    premium_unusual = unusual_activity.get('premium_unusual', [])
+    if premium_unusual:
+        section += f"UNUSUAL PREMIUM: {len(premium_unusual)} high-value trades\n"
+        for i, item in enumerate(premium_unusual[:3], 1):
+            section += f"{i}. {item.get('symbol', 'N/A')} - ${item.get('premium', 0):,.0f}\n"
+            section += f"   Contracts: {item.get('contracts', 0):,} | Side: {item.get('primary_side', 'N/A')}\n"
+        section += "\n"
+    
+    # IV unusual
+    iv_unusual = unusual_activity.get('iv_unusual', [])
+    if iv_unusual:
+        section += f"UNUSUAL IV ACTIVITY: {len(iv_unusual)} options with IV changes\n"
+        for i, item in enumerate(iv_unusual[:3], 1):
+            section += f"{i}. {item.get('symbol', 'N/A')}\n"
+            section += f"   IV Change: {item.get('iv_change_pct', 0):+.1f}% ({item.get('iv_start', 0):.1%} → {item.get('iv_end', 0):.1%})\n"
+        section += "\n"
+    
+    # Summary
+    summary = unusual_activity.get('summary', {})
+    if summary: # Check if summary dict itself is not empty
+        section += "UNUSUAL ACTIVITY SUMMARY:\n"
+        section += f"• Alert Level: {summary.get('alert_level', 'Normal')}\n"
+        section += f"• Total Detections: {summary.get('total_detections', 0)}\n"
+        section += f"• High Priority Items: {summary.get('high_priority_count', 0)}\n"
+        
+        top_symbols = summary.get('top_symbols', [])
+        if top_symbols: # Check if top_symbols list is not empty
+            section += "• Most Active Symbols: " + ", ".join([f"{sym}({count})" for sym, count in top_symbols[:5]]) + "\n"
+        section += "\n"
+    
+    return section
+
+def _generate_volatility_analysis_section(analysis_results: dict) -> str:
+    """Generate volatility analysis section"""
+    
+    section = ""
+    vol_analysis = analysis_results.get('volatility_analysis', {})
+    
+    if not vol_analysis:
+        section += "No volatility analysis data available.\n"
+        return section
+    
+    # Basic IV stats
+    basic_iv = vol_analysis.get('basic_iv_stats', {})
+    if basic_iv:
+        section += "IMPLIED VOLATILITY OVERVIEW:\n"
+        section += f"• Average IV: {basic_iv.get('mean_iv', 0):.1%}\n"
+        section += f"• Median IV: {basic_iv.get('median_iv', 0):.1%}\n"
+        section += f"• IV Range: {basic_iv.get('min_iv', 0):.1%} - {basic_iv.get('max_iv', 0):.1%}\n"
+        section += f"• IV Std Dev: {basic_iv.get('std_iv', 0):.1%}\n"
+        
+        if basic_iv.get('volume_weighted_iv'):
+            section += f"• Volume-Weighted IV: {basic_iv['volume_weighted_iv']:.1%}\n"
+        section += "\n"
+    
+    # Vol skew
+    vol_skew = vol_analysis.get('vol_skew', {})
+    if vol_skew:
+        put_skew = vol_skew.get('put_skew', {})
+        call_skew = vol_skew.get('call_skew', {})
+        
+        section += "VOLATILITY SKEW:\n"
+        if put_skew.get('skew_slope'):
+            section += f"• Put Skew Slope: {put_skew['skew_slope']:.3f}\n"
+        if call_skew.get('skew_slope'):
+            section += f"• Call Skew Slope: {call_skew['skew_slope']:.3f}\n"
+        
+        overall_slope = vol_skew.get('skew_slope', 0)
+        if overall_slope != 0:
+            skew_desc = "Negative (Put bias)" if overall_slope < 0 else "Positive (Call bias)"
+            section += f"• Overall Skew: {overall_slope:.3f} ({skew_desc})\n"
+        section += "\n"
+    
+    # Term structure
+    term_structure = vol_analysis.get('term_structure', {})
+    if term_structure:
+        section += "VOLATILITY TERM STRUCTURE:\n"
+        slope = term_structure.get('term_structure_slope', 0)
+        if slope != 0:
+            structure_type = term_structure.get('contango_backwardation', 'flat')
+            section += f"• Structure: {structure_type.title()}\n"
+            section += f"• Slope: {slope:.4f}\n"
+        
+        opportunities = term_structure.get('term_structure_opportunities', [])
+        if opportunities:
+            section += "• Calendar Opportunities:\n"
+            for opp in opportunities[:3]:
+                section += f"  - {opp.get('near_dte', 0)}DTE vs {opp.get('far_dte', 0)}DTE: {opp.get('iv_difference', 0):.1%} diff\n"
+        section += "\n"
+    
+    # IV rank/percentile
+    iv_rank = vol_analysis.get('iv_rank_percentile', {})
+    if iv_rank:
+        section += "IV REGIME ANALYSIS:\n"
+        section += f"• Current Regime: {iv_rank.get('iv_regime', 'unknown').replace('_', ' ').title()}\n"
+        section += f"• Current Avg IV: {iv_rank.get('current_avg_iv', 0):.1%}\n"
+        section += f"• IV Range (Session): {iv_rank.get('iv_range', 0):.1%}\n\n"
+    
+    # Trading opportunities
+    vol_opportunities = vol_analysis.get('vol_trading_opportunities', {})
+    if vol_opportunities:
+        cheap_vol = vol_opportunities.get('cheap_vol', [])
+        expensive_vol = vol_opportunities.get('expensive_vol', [])
+        
+        if cheap_vol:
+            section += f"CHEAP VOLATILITY OPPORTUNITIES ({len(cheap_vol)}):\n"
+            for opp in cheap_vol[:3]:
+                section += f"• {opp.get('symbol', 'N/A')}: {opp.get('current_iv', 0):.1%} IV\n"
+                section += f"  Confidence: {opp.get('confidence', 0):.0f}% | Entry: ${opp.get('vwap', 0):.2f}\n"
+        
+        if expensive_vol:
+            section += f"EXPENSIVE VOLATILITY OPPORTUNITIES ({len(expensive_vol)}):\n"
+            for opp in expensive_vol[:3]:
+                section += f"• {opp.get('symbol', 'N/A')}: {opp.get('current_iv', 0):.1%} IV\n"
+                section += f"  Confidence: {opp.get('confidence', 0):.0f}% | Entry: ${opp.get('vwap', 0):.2f}\n"
+        section += "\n"
+    
+    return section
+
+def _generate_greek_analysis_section(analysis_results: dict) -> str:
+    """Generate Greek analysis section"""
+    
+    section = ""
+    greek_analysis = analysis_results.get('greek_analysis', {})
+    
+    if not greek_analysis:
+        section += "No Greek analysis data available.\n"
+        return section
+    
+    # Greek exposures
+    greek_exposures = greek_analysis.get('greek_exposures', {})
+    if greek_exposures:
+        section += "GREEK EXPOSURES:\n"
+        section += f"• Net Delta: {greek_exposures.get('net_delta', 0):,.0f} shares\n"
+        section += f"• Net Gamma: ${greek_exposures.get('net_gamma', 0):,.0f}\n"
+        section += f"• Net Vega: ${greek_exposures.get('net_vega', 0):,.0f}\n"
+        section += f"• Net Theta: ${greek_exposures.get('net_theta', 0):,.0f}/day\n\n"
+    
+    # Market maker positioning
+    mm_position = greek_analysis.get('market_maker_position', {})
+    if mm_position:
+        section += "ESTIMATED MARKET MAKER POSITIONING:\n"
+        section += f"• Position: {mm_position.get('estimated_position', 'Neutral')}\n"
+        section += f"• Hedging Pressure: {mm_position.get('hedging_pressure', 0):,.0f}\n"
+        section += f"• Gamma Imbalance: ${mm_position.get('gamma_imbalance', 0):,.0f}\n"
+        
+        pinning_strikes = mm_position.get('pinning_strikes', [])
+        if pinning_strikes:
+            section += "• Potential Pin Points:\n"
+            for pin in pinning_strikes[:3]:
+                section += f"  - ${pin.get('strike', 0):.0f}: {pin.get('pin_strength', 'Unknown')} gamma\n"
+        section += "\n"
+    
+    # Hedging flows
+    hedging_flows = greek_analysis.get('hedging_flows', [])
+    if hedging_flows:
+        section += f"HEDGING FLOW DETECTION ({len(hedging_flows)}):\n"
+        for i, flow in enumerate(hedging_flows[:3], 1):
+            section += f"{i}. {flow.get('type', 'Unknown')} at {flow.get('time', 'N/A')}\n"
+            if flow.get('trades'):
+                section += f"   Instruments: {len(flow['trades'])} legs\n"
+        section += "\n"
+    
+    return section
+
+def _generate_strategy_analysis_section(analysis_results: dict) -> str:
+    """Generate strategy analysis section"""
+    
+    section = ""
+    strategy_analysis = analysis_results.get('strategy_analysis', {})
+    
+    if not strategy_analysis:
+        section += "No strategy analysis data available.\n"
+        return section
+    
+    identified_strategies = strategy_analysis.get('identified_strategies', [])
+    if identified_strategies:
+        section += f"IDENTIFIED STRATEGIES ({len(identified_strategies)}):\n\n"
+        
+        for i, strategy in enumerate(identified_strategies[:5], 1):
+            section += f"{i}. {strategy.get('strategy_name', 'Unknown Strategy')}\n"
+            section += f"   Legs: {strategy.get('num_legs', 0)} | Notional: ${strategy.get('total_notional', 0):,.0f}\n"
+            section += f"   Net Premium: ${strategy.get('net_debit_credit', 0):,.0f}\n"
+            
+            if strategy.get('strikes'):
+                strikes_str = " / ".join([f"${s:.0f}" for s in strategy['strikes']])
+                section += f"   Strikes: {strikes_str}\n"
+            
+            if strategy.get('expiration'):
+                section += f"   Expiration: {strategy['expiration']}\n"
+            
+            # Quality metrics
+            quality = strategy.get('quality_metrics', {})
+            if quality:
+                section += f"   Outlook: {quality.get('market_outlook', 'Neutral')}\n"
+                section += f"   Complexity: {quality.get('complexity_score', 0)}/100\n"
+            
+            section += "\n"
+    
+    # Strategy summary
+    strategy_summary = strategy_analysis.get('strategy_summary', {})
+    if strategy_summary:
+        section += "STRATEGY BREAKDOWN:\n"
+        for strat_type, count in strategy_summary.items():
+            section += f"• {strat_type.replace('_', ' ').title()}: {count}\n"
+        section += "\n"
+    
+    # Institutional vs retail strategies
+    institutional_strategies = strategy_analysis.get('institutional_strategies', [])
+    retail_strategies = strategy_analysis.get('retail_strategies', [])
+    
+    section += f"STRATEGY CLASSIFICATION:\n"
+    section += f"• Institutional Strategies: {len(institutional_strategies)}\n"
+    section += f"• Retail Strategies: {len(retail_strategies)}\n"
+    section += f"• Complex Positions (3+ legs): {len(strategy_analysis.get('complex_positions', []))}\n\n"
+    
+    return section
+
+def _generate_options_of_interest_section(analysis_results: dict) -> str:
+    """Generate options of interest section"""
+    
+    section = ""
+    options_of_interest = analysis_results.get('options_of_interest_details', [])
+    
+    if not options_of_interest:
+        section += "No specific options of interest identified.\n"
+        return section
+    
+    section += f"TOP OPTIONS OF INTEREST ({len(options_of_interest)}):\n\n"
+    
+    for i, option in enumerate(options_of_interest[:15], 1):
+        section += f"{i:2d}. {option.get('symbol', 'N/A')}\n"
+        section += f"    Score: {option.get('score', 0):.1f} | Direction: {option.get('direction', 'NEUTRAL')}\n"
+        section += f"    Confidence: {option.get('confidence', 0):.0f}% | Source: {option.get('source', 'Unknown')}\n"
+        section += f"    Reason: {option.get('reason', 'N/A')}\n\n"
+    
+    return section
+
+def _generate_risk_assessment_section(analysis_results: dict) -> str:
+    """Generate risk assessment section"""
+    
+    section = ""
+    risk_alerts = analysis_results.get('risk_alerts', [])
+    
+    if risk_alerts:
+        section += f"RISK ALERTS ({len(risk_alerts)}):\n"
+        for alert in risk_alerts:
+            section += f"⚠️  {alert}\n"
+        section += "\n"
+    else:
+        section += "No significant risk alerts identified.\n\n"
+    
+    # Market condition assessment
+    composite_scores = analysis_results.get('composite_scores', {})
+    if composite_scores:
+        section += "MARKET CONDITION ASSESSMENT:\n"
+        section += f"• Overall Conviction: {composite_scores.get('overall_conviction', 0):.0f}/100\n"
+        section += f"• Volatility Expectation: {composite_scores.get('volatility_expectation', 0):.0f}/100\n"
+        section += f"• Institutional Activity: {composite_scores.get('institutional_activity', 0):.0f}/100\n"
+        
+        # Risk level determination
+        conviction = composite_scores.get('overall_conviction', 0)
+        if conviction >= 80:
+            risk_level = "HIGH CONVICTION - Strong directional bias"
+        elif conviction >= 60:
+            risk_level = "MODERATE CONVICTION - Some directional bias"
+        elif conviction >= 40:
+            risk_level = "LOW CONVICTION - Mixed signals"
+        else:
+            risk_level = "VERY LOW CONVICTION - Unclear direction"
+        
+        section += f"• Risk Assessment: {risk_level}\n\n"
+    
+    return section
+
+def _generate_trade_recommendations_section(analysis_results: dict) -> str:
+    """Generate trade recommendations section"""
+    
+    section = ""
+    recommendations = analysis_results.get('trade_recommendations', [])
+    
+    if not recommendations:
+        section += "No specific trade recommendations generated.\n"
+        return section
+    
+    section += f"TRADE RECOMMENDATIONS ({len(recommendations)}):\n\n"
+    
+    for i, rec in enumerate(recommendations, 1):
+        section += f"{i:2d}. {rec}\n\n"
+    
+    # Risk management notes
+    section += "RISK MANAGEMENT NOTES:\n"
+    section += "• Always use appropriate position sizing\n"
+    section += "• Set stop losses based on your risk tolerance\n"
+    section += "• Monitor implied volatility changes\n"
+    section += "• Be aware of upcoming earnings/events\n"
+    section += "• Consider time decay for option positions\n\n"
+    
+    return section
+
+def _generate_key_insights_section(analysis_results: dict) -> str:
+    """Generate key insights section"""
+    
+    section = ""
+    key_insights = analysis_results.get('key_insights', [])
+    
+    if not key_insights:
+        section += "No key insights generated.\n"
+        return section
+    
+    section += "KEY INSIGHTS:\n\n"
+    
+    for i, insight in enumerate(key_insights, 1):
+        section += f"{i}. {insight}\n\n"
+    
+    return section
+
+def generate_trade_briefing(analysis_results: dict, ticker: str) -> str:
+    """Generate concise trade briefing"""
+    
+    briefing = f"""
+TRADE BRIEFING - {ticker}
+{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+{'=' * 50}
+
+"""
+    
+    # Quick stats
+    data_summary = analysis_results.get('data_summary', {})
+    briefing += f"📊 SNAPSHOT:\n"
+    briefing += f"Trades: {data_summary.get('total_trades', 0):,} | "
+    briefing += f"Volume: {data_summary.get('total_volume', 0):,} | "
+    briefing += f"Premium: ${data_summary.get('total_notional', 0):,.0f}\n\n"
+    
+    # Top alpha signals
+    alpha_signals = analysis_results.get('alpha_signals', [])
+    if alpha_signals:
+        urgent_signals = [s for s in alpha_signals if hasattr(s, 'urgency_score') and s.urgency_score >= 85]
+        briefing += f"🎯 ALPHA SIGNALS: {len(alpha_signals)} total ({len(urgent_signals)} urgent)\n"
+        
+        if urgent_signals:
+            top_signal = max(urgent_signals, key=lambda x: x.urgency_score)
+            briefing += f"🚨 MOST URGENT: {top_signal.trade_recommendation}\n"
+        briefing += "\n"
+    
+    # Flow bias
+    flow_analysis = analysis_results.get('flow_analysis', {})
+    if flow_analysis:
+        directional_flow = flow_analysis.get('directional_flow', {})
+        cp_ratio = directional_flow.get('call_put_volume_ratio', 1)
+        
+        briefing += f"📈 FLOW BIAS: "
+        if cp_ratio > 1.2:
+            briefing += f"BULLISH (C/P: {cp_ratio:.2f})\n"
+        elif cp_ratio < 0.8:
+            briefing += f"BEARISH (C/P: {cp_ratio:.2f})\n"
+        else:
+            briefing += f"NEUTRAL (C/P: {cp_ratio:.2f})\n"
+        briefing += "\n"
+    
+    # Top opportunities
+    options_of_interest = analysis_results.get('options_of_interest_details', [])
+    if options_of_interest:
+        briefing += f"🔥 TOP OPPORTUNITIES:\n"
+        for i, option in enumerate(options_of_interest[:3], 1):
+            briefing += f"{i}. {option.get('symbol', 'N/A')} - {option.get('direction', 'NEUTRAL')}\n"
+            briefing += f"   {option.get('reason', 'N/A')}\n"
+        briefing += "\n"
+    
+    # Risk alerts
+    risk_alerts = analysis_results.get('risk_alerts', [])
+    if risk_alerts:
+        briefing += f"⚠️  RISK ALERTS:\n"
+        for alert in risk_alerts[:3]:
+            briefing += f"• {alert}\n"
+        briefing += "\n"
+    
+    # Quick recommendations
+    recommendations = analysis_results.get('trade_recommendations', [])
+    if recommendations:
+        briefing += f"💡 QUICK RECS:\n"
+        for rec in recommendations[:3]:
+            briefing += f"• {rec}\n"
+    
+    briefing += f"\n{'=' * 50}\n"
+    
+    return briefing
+
+def export_analysis_to_json(analysis_results: dict, filepath: str) -> bool:
+    """Export analysis results to JSON"""
+    
+    try:
+        # Convert any non-serializable objects
+        serializable_results = _make_serializable(analysis_results)
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(serializable_results, f, indent=2, default=str)
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error exporting to JSON: {e}")
+        return False
+
+def _make_serializable(obj):
+    """Convert objects to JSON-serializable format"""
+    
+    if hasattr(obj, '__dict__'):
+        return obj.__dict__
+    elif isinstance(obj, dict):
+        return {k: _make_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_make_serializable(item) for item in obj]
+    elif hasattr(obj, 'isoformat'):  # datetime objects
+        return obj.isoformat()
+    else:
+        return obj
+    
+    section += f"Total Alpha Signals: {len(alpha_signals)}\n\n"
+    
+    # Group by signal type
+    signal_types = {}
+    for signal in alpha_signals:
+        sig_type = signal.signal_type.value
+        if sig_type not in signal_types:
+            signal_types[sig_type] = []
+        signal_types[sig_type].append(signal)
+    
+    section += "SIGNAL TYPE BREAKDOWN:\n"
+    for sig_type, signals in signal_types.items():
+        section += f"• {sig_type}: {len(signals)} signals\n"
+    
+    section += "\nTOP ALPHA SIGNALS:\n"
+    section += "-" * 50 + "\n"
+    
+    # Sort by composite score (confidence * urgency)
+    sorted_signals = sorted(alpha_signals, 
+                          key=lambda x: x.confidence * x.urgency_score, 
+                          reverse=True)
+    
+    for i, signal in enumerate(sorted_signals[:10], 1):
+        section += f"{i:2d}. {signal.signal_type.value} - {signal.direction}\n"
+        section += f"    Symbol: {signal.option_symbol}\n"
+        section += f"    Entry: ${signal.entry_price:.2f} | Notional: ${signal.notional_value:,.0f}\n"
+        section += f"    Confidence: {signal.confidence:.0f}% | Urgency: {signal.urgency_score:.0f} | Smart Money: {signal.smart_money_score:.0f}\n"
+        
+        if signal.target_price:
+            section += f"    Target: ${signal.target_price:.2f}"
+        if signal.stop_price:
+            section += f" | Stop: ${signal.stop_price:.2f}"
+        section += "\n"
+        
+        section += f"    📋 {signal.trade_recommendation}\n\n"
+    
+    return section
+
+def _generate_flow_analysis_section(analysis_results: dict) -> str:
+    """Generate flow analysis section"""
+    
+    section = ""
+    flow_analysis = analysis_results.get('flow_analysis', {})
+    
+    if not flow_analysis:
+        section += "No flow analysis data available.\n"
+        return section
+    
+    # Basic metrics
+    basic_metrics = flow_analysis.get('basic_metrics', {})
+    section += "BASIC FLOW METRICS:\n"
+    section += f"• Total Trades: {basic_metrics.get('total_trades', 0):,}\n"
+    section += f"• Total Contracts: {basic_metrics.get('total_contracts', 0):,}\n"
+    section += f"• Total Premium: ${basic_metrics.get('total_premium', 0):,.0f}\n"
+    section += f"• Average Trade Size: {basic_metrics.get('avg_trade_size', 0):.1f}\n"
+    section += f"• Unique Options: {basic_metrics.get('unique_options', 0):,}\n\n"
+    
+    # Directional flow
+    directional_flow = flow_analysis.get('directional_flow', {})
+    if directional_flow:
+        section += "DIRECTIONAL FLOW:\n"
+        section += f"• Call Volume: {directional_flow.get('call_volume', 0):,}\n"
+        section += f"• Put Volume: {directional_flow.get('put_volume', 0):,}\n"
+        section += f"• Call/Put Ratio: {directional_flow.get('call_put_volume_ratio', 1):.2f}\n"
+        section += f"• Net Flow: {directional_flow.get('net_volume', 0):+,} contracts\n\n"
+    
+    # Size analysis
+    size_analysis = flow_analysis.get('size_analysis', {})
+    if size_analysis:
+        section += "TRADE SIZE DISTRIBUTION:\n"
+        section += f"• Small Trades (≤10): {size_analysis.get('small_trades_pct', 0):.1f}%\n"
+        section += f"• Medium Trades (11-50): {size_analysis.get('medium_trades_pct', 0):.1f}%\n"
+        section += f"• Large Trades (51-100): {size_analysis.get('large_trades_pct', 0):.1f}%\n"
+        section += f"• Block Trades (>100): {size_analysis.get('block_trades_pct', 0):.1f}%\n\n"
+    
+    # Significant flows
+    significant_flows = flow_analysis.get('significant_flows', [])
+    if significant_flows:
+        section += "SIGNIFICANT FLOWS:\n"
+        for i, flow in enumerate(significant_flows[:5], 1):
+            section += f"{i}. {flow.get('symbol', 'N/A')} - {flow.get('type', 'N/A')}\n"
+            section += f"   Volume: {flow.get('volume', 0):,} | Notional: ${flow.get('notional', 0):,.0f}\n"
+            section += f"   Significance Score: {flow.get('significance_score', 0):.1f}\n\n"
+    
+    return section
+
+def _generate_pattern_analysis_section(analysis_results: dict) -> str:
+    """Generate pattern analysis section"""
+    
+    section = ""
+    pattern_analysis = analysis_results.get('pattern_analysis', {})
+    
+    if not pattern_analysis:
+        section += "No pattern analysis data available.\n"
+        return section
+    
+    detected_patterns = pattern_analysis.get('detected_patterns', {})
+    
+    # Block trades
+    block_trades = detected_patterns.get('block_trades', {})
+    if block_trades.get('count', 0) > 0:
+        section += f"BLOCK TRADES: {block_trades['count']} detected\n"
+        section += f"• Total Volume: {block_trades.get('total_volume', 0):,} contracts\n"
+        section += f"• Average Size: {block_trades.get('avg_size', 0):.1f} contracts\n"
+        section += f"• Largest Trade: {block_trades.get('max_size', 0):,} contracts\n\n"
+    
+    # Sweep orders
+    sweep_orders = detected_patterns.get('sweep_orders', {})
+    if sweep_orders.get('count', 0) > 0:
+        section += f"SWEEP ORDERS: {sweep_orders['count']} detected\n"
+        sweeps = sweep_orders.get('sweeps', [])
+        if sweeps:
+            section += "Top Sweeps:\n"
+            for i, sweep in enumerate(sweeps[:3], 1):
+                section += f"{i}. {sweep.get('symbol', 'N/A')} - {sweep.get('direction', 'N/A')}\n"
+                section += f"   Legs: {sweep.get('trade_count', 0)} | Urgency: {sweep.get('urgency_score', 0):.0f}\n"
+        section += "\n"
+    
+    # Pattern summary
+    pattern_summary = pattern_analysis.get('pattern_summary', {})
+    if pattern_summary:
+        section += "PATTERN SUMMARY:\n"
+        section += f"• Total Patterns: {pattern_summary.get('total_patterns', 0)}\n"
+        if pattern_summary.get('highest_confidence_pattern'):
+            section += f"• Highest Confidence: {pattern_summary['highest_confidence_pattern']}\n"
+        section += f"• Pattern Diversity: {pattern_summary.get('pattern_diversity', 0)}\n\n"
+    
+    # Institutional vs Retail indicators
+    institutional = pattern_analysis.get('institutional_indicators', [])
+    retail = pattern_analysis.get('retail_indicators', [])
+    
+    if institutional:
+        section += "INSTITUTIONAL INDICATORS:\n"
+        for indicator in institutional[:3]:
+            section += f"• {indicator.get('indicator', 'N/A')}: {indicator.get('count', 0)} occurrences\n"
+            section += f"  Confidence: {indicator.get('confidence', 0):.0f}%\n"
+        section += "\n"
+    
+    if retail:
+        section += "RETAIL INDICATORS:\n"
+        for indicator in retail[:3]:
+            section += f"• {indicator.get('indicator', 'N/A')}: {indicator.get('count', 0)} occurrences\n"
+            section += f"  Confidence: {indicator.get('confidence', 0):.0f}%\n"
+        section += "\n"
+    
+    return section
